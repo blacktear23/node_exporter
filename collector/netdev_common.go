@@ -20,6 +20,8 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"sync"
+	"time"
 
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
@@ -34,12 +36,53 @@ var (
 	oldNetdevDeviceExclude = kingpin.Flag("collector.netdev.device-blacklist", "DEPRECATED: Use collector.netdev.device-exclude").Hidden().String()
 )
 
+type HistoryData struct {
+	data []uint64
+	pos  int
+	lock sync.Mutex
+}
+
+func NewHistoryData(size int) *HistoryData {
+	return &HistoryData{
+		data: make([]uint64, size),
+		pos:  0,
+	}
+}
+
+func (d *HistoryData) Append(val uint64) {
+	d.lock.Lock()
+	defer d.lock.Unlock()
+	d.data[d.pos] = val
+	d.pos++
+	if d.pos >= len(d.data) {
+		d.pos = 0
+	}
+}
+
+func (d *HistoryData) Max() uint64 {
+	d.lock.Lock()
+	defer d.lock.Unlock()
+	max := uint64(0)
+	for _, val := range d.data {
+		if val > max {
+			max = val
+		}
+	}
+	return max
+}
+
 type netDevCollector struct {
 	subsystem            string
 	deviceExcludePattern *regexp.Regexp
 	deviceIncludePattern *regexp.Regexp
 	metricDescs          map[string]*prometheus.Desc
 	logger               log.Logger
+	bwSendHistory        map[string]*HistoryData
+	bwRecvHistory        map[string]*HistoryData
+	prevSendBytes        map[string]uint64
+	prevRecvBytes        map[string]uint64
+	historySize          int
+	duration             int
 }
 
 type netDevStats map[string]map[string]uint64
@@ -84,13 +127,21 @@ func NewNetDevCollector(logger log.Logger) (Collector, error) {
 		includePattern = regexp.MustCompile(*netdevDeviceInclude)
 	}
 
-	return &netDevCollector{
+	ret := &netDevCollector{
 		subsystem:            "network",
 		deviceExcludePattern: excludePattern,
 		deviceIncludePattern: includePattern,
 		metricDescs:          map[string]*prometheus.Desc{},
 		logger:               logger,
-	}, nil
+		bwSendHistory:        map[string]*HistoryData{},
+		bwRecvHistory:        map[string]*HistoryData{},
+		prevSendBytes:        map[string]uint64{},
+		prevRecvBytes:        map[string]uint64{},
+		historySize:          20,
+		duration:             3,
+	}
+	go ret.RunMaxBandwidthCollect(logger)
+	return ret, nil
 }
 
 func (c *netDevCollector) Update(ch chan<- prometheus.Metric) error {
@@ -113,5 +164,110 @@ func (c *netDevCollector) Update(ch chan<- prometheus.Metric) error {
 			ch <- prometheus.MustNewConstMetric(desc, prometheus.CounterValue, float64(value), dev)
 		}
 	}
+	for dev, bwRecvHist := range c.bwRecvHistory {
+		bw := bwRecvHist.Max()
+		key := "receive_max_bandwidth"
+		desc, ok := c.metricDescs[key]
+		if !ok {
+			desc = prometheus.NewDesc(
+				prometheus.BuildFQName(namespace, c.subsystem, key),
+				fmt.Sprintf("Network device statistic %s.", key),
+				[]string{"device"},
+				nil,
+			)
+			c.metricDescs[key] = desc
+		}
+		ch <- prometheus.MustNewConstMetric(desc, prometheus.GaugeValue, float64(bw), dev)
+	}
+	for dev, bwSendHist := range c.bwSendHistory {
+		bw := bwSendHist.Max()
+		key := "transmit_max_bandwidth"
+		desc, ok := c.metricDescs[key]
+		if !ok {
+			desc = prometheus.NewDesc(
+				prometheus.BuildFQName(namespace, c.subsystem, key),
+				fmt.Sprintf("Network device statistic %s.", key),
+				[]string{"device"},
+				nil,
+			)
+			c.metricDescs[key] = desc
+		}
+		ch <- prometheus.MustNewConstMetric(desc, prometheus.GaugeValue, float64(bw), dev)
+	}
 	return nil
+}
+
+func (c *netDevCollector) RunMaxBandwidthCollect(logger log.Logger) {
+	err := c.getNetworkBandwidth(false)
+	if err != nil {
+		level.Error(logger).Log("msg", "Max bandwidth collector failed", "err", err)
+	}
+	for {
+		time.Sleep(time.Duration(c.duration) * time.Second)
+		err = c.getNetworkBandwidth(true)
+		if err != nil {
+			level.Error(logger).Log("msg", "Max bandwidth collector failed", "err", err)
+		}
+	}
+}
+
+func (c *netDevCollector) getNetworkBandwidth(calculateMax bool) error {
+	netDev, err := getNetDevStats(c.deviceExcludePattern, c.deviceIncludePattern, c.logger)
+	if err != nil {
+		return fmt.Errorf("couldn't get netstats: %w", err)
+	}
+	for dev, devStats := range netDev {
+		recvBytes, have := devStats["receive_bytes"]
+		if !have {
+			continue
+		}
+		sendBytes, have := devStats["transmit_bytes"]
+		if !have {
+			continue
+		}
+		recvBandwidth, sendBandwidth := c.calculateBandwidth(dev, recvBytes, sendBytes)
+		if calculateMax {
+			c.updateDeviceBandwidth(dev, recvBandwidth, sendBandwidth)
+		}
+	}
+	return nil
+}
+
+func (c *netDevCollector) calculateBandwidth(dev string, recvBytes, sendBytes uint64) (recvBw uint64, sendBw uint64) {
+	prevRecv, have := c.prevRecvBytes[dev]
+	if have {
+		recvBw = (recvBytes - prevRecv) / uint64(c.duration)
+	} else {
+		recvBw = 0
+	}
+
+	prevSend, have := c.prevSendBytes[dev]
+	if have {
+		sendBw = (sendBytes - prevSend) / uint64(c.duration)
+	} else {
+		sendBw = 0
+	}
+
+	c.prevRecvBytes[dev] = recvBytes
+	c.prevSendBytes[dev] = sendBytes
+	return
+}
+
+func (c *netDevCollector) updateDeviceBandwidth(dev string, recvBandwidth, sendBandwidth uint64) {
+	recvHist, have := c.bwRecvHistory[dev]
+	if have {
+		recvHist.Append(recvBandwidth)
+	} else {
+		newRecvHist := NewHistoryData(c.historySize)
+		newRecvHist.Append(recvBandwidth)
+		c.bwRecvHistory[dev] = newRecvHist
+	}
+	sendHist, have := c.bwSendHistory[dev]
+	if have {
+		sendHist.Append(sendBandwidth)
+	} else {
+		newSendHist := NewHistoryData(c.historySize)
+		newSendHist.Append(sendBandwidth)
+		c.bwSendHistory[dev] = newSendHist
+	}
 }
