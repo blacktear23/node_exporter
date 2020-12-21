@@ -30,10 +30,12 @@ import (
 )
 
 var (
-	netdevDeviceInclude    = kingpin.Flag("collector.netdev.device-include", "Regexp of net devices to include (mutually exclusive to device-exclude).").String()
-	oldNetdevDeviceInclude = kingpin.Flag("collector.netdev.device-whitelist", "DEPRECATED: Use collector.netdev.device-include").Hidden().String()
-	netdevDeviceExclude    = kingpin.Flag("collector.netdev.device-exclude", "Regexp of net devices to exclude (mutually exclusive to device-include).").String()
-	oldNetdevDeviceExclude = kingpin.Flag("collector.netdev.device-blacklist", "DEPRECATED: Use collector.netdev.device-exclude").Hidden().String()
+	netdevDeviceInclude           = kingpin.Flag("collector.netdev.device-include", "Regexp of net devices to include (mutually exclusive to device-exclude).").String()
+	oldNetdevDeviceInclude        = kingpin.Flag("collector.netdev.device-whitelist", "DEPRECATED: Use collector.netdev.device-include").Hidden().String()
+	netdevDeviceExclude           = kingpin.Flag("collector.netdev.device-exclude", "Regexp of net devices to exclude (mutually exclusive to device-include).").String()
+	oldNetdevDeviceExclude        = kingpin.Flag("collector.netdev.device-blacklist", "DEPRECATED: Use collector.netdev.device-exclude").Hidden().String()
+	netDevMaxBandwidthDuration    = kingpin.Flag("collector.netdev.max-bandwidth-duration", "Duration for max bandwidth collect, unit is second.").Default("2").Int()
+	netDevMaxBandwidthHistorySize = kingpin.Flag("collector.netdev.max-bandwidth-history-size", "Number bandwidth metrics stored in history queue.").Default("30").Int()
 )
 
 type HistoryData struct {
@@ -137,8 +139,8 @@ func NewNetDevCollector(logger log.Logger) (Collector, error) {
 		bwRecvHistory:        map[string]*HistoryData{},
 		prevSendBytes:        map[string]uint64{},
 		prevRecvBytes:        map[string]uint64{},
-		historySize:          20,
-		duration:             3,
+		historySize:          *netDevMaxBandwidthHistorySize,
+		duration:             *netDevMaxBandwidthDuration,
 	}
 	go ret.RunMaxBandwidthCollect(logger)
 	return ret, nil
